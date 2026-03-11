@@ -252,18 +252,25 @@ actor AudioRecorderActor {
     // MARK: - Private: Engine + Tap
 
     private func startEngineAndTap(quality: AudioQuality) throws {
-        let inputNode = engine.inputNode
-
         // IMPORTANT: Always remove any existing tap first.
         // If a tap is already installed (e.g. from a previous session or
         // failed cleanup during interruption/route-change), calling installTap
         // again crashes with: 'required condition is false: nullptr == Tap()'
-        inputNode.removeTap(onBus: 0)
+        engine.inputNode.removeTap(onBus: 0)
 
-        // Also ensure the engine is stopped before reconfiguring
+        // Stop and RESET the engine to clear any cached format graph.
+        // Without reset(), the engine keeps the old input device's format
+        // (e.g. AirPods 16kHz HFP) and when the new device has a different
+        // format (e.g. built-in mic 48kHz), engine.start() fails with
+        // error -10868 (kAudioUnitErr_FormatNotSupported).
         if engine.isRunning {
             engine.stop()
         }
+        engine.reset()
+
+        // After reset(), we must re-acquire the inputNode reference because
+        // reset() can invalidate the old node's internal state.
+        let inputNode = engine.inputNode
 
         // IMPORTANT: Pass `nil` as the tap format so AVAudioEngine delivers
         // buffers in its own native format. On real devices the hardware format
@@ -277,6 +284,7 @@ actor AudioRecorderActor {
 
         // We'll detect the actual format from the first buffer
         needsSegmentFileOpen = true
+        inputFormat = nil   // Clear old format — new device may have different sample rate/channels
 
         inputNode.installTap(onBus: 0,
                              bufferSize: AudioRecorderActor.tapBufferSize,
@@ -333,7 +341,32 @@ actor AudioRecorderActor {
         }
 
         engine.prepare()
-        try engine.start()
+
+        // engine.start() can fail with -10868 if the audio hardware hasn't
+        // fully settled after a device switch. Retry up to 3 times.
+        var started = false
+        var lastError: Error?
+        for attempt in 1...3 {
+            do {
+                try engine.start()
+                started = true
+                break
+            } catch {
+                lastError = error
+                print("[AudioRecorderActor] ⚠️ engine.start() attempt \(attempt) failed: \(error)")
+                if attempt < 3 {
+                    // Small delay to let hardware settle
+                    Thread.sleep(forTimeInterval: 0.2)
+                    // Re-reset and re-prepare
+                    engine.stop()
+                    engine.reset()
+                    engine.prepare()
+                }
+            }
+        }
+        if !started {
+            throw lastError ?? AudioError.engineStartFailed
+        }
     }
 
     /// Capture raw sample bytes from an AVAudioPCMBuffer immediately on the audio thread.
