@@ -128,8 +128,15 @@ actor AudioRecorderActor {
         // 3. Configure AVAudioSession
         try await configureAVAudioSession(quality: quality)
 
-        // 4. Start engine + tap
-        try startEngineAndTap(quality: quality)
+        // 4. Start engine + tap (with fallback for format mismatches)
+        do {
+            try startEngineAndTap(quality: quality)
+        } catch {
+            print("[AudioRecorderActor] ⚠️ startEngineAndTap failed: \(error) — attempting full restart")
+            guard attemptFullEngineRestart(quality: quality) else {
+                throw AudioError.engineStartFailed
+            }
+        }
 
         // 5. Register for notifications
         observeInterruptions()
@@ -164,7 +171,14 @@ actor AudioRecorderActor {
         // Just calling engine.start() with the old tap will crash or silently fail.
         try await configureAVAudioSession(quality: quality)
         // startEngineAndTap already does removeTap + engine.stop() + installTap
-        try startEngineAndTap(quality: quality)
+        do {
+            try startEngineAndTap(quality: quality)
+        } catch {
+            print("[AudioRecorderActor] ⚠️ Resume: startEngineAndTap failed: \(error) — attempting full restart")
+            guard attemptFullEngineRestart(quality: quality) else {
+                throw AudioError.engineStartFailed
+            }
+        }
 
         state = .recording(sessionID: sessionID)
         try await dataManager.updateSession(id: sessionID, state: .recording)
@@ -341,31 +355,61 @@ actor AudioRecorderActor {
         }
 
         engine.prepare()
+        try engine.start()
+    }
 
-        // engine.start() can fail with -10868 if the audio hardware hasn't
-        // fully settled after a device switch. Retry up to 3 times.
-        var started = false
-        var lastError: Error?
-        for attempt in 1...3 {
-            do {
-                try engine.start()
-                started = true
-                break
-            } catch {
-                lastError = error
-                print("[AudioRecorderActor] ⚠️ engine.start() attempt \(attempt) failed: \(error)")
-                if attempt < 3 {
-                    // Small delay to let hardware settle
-                    Thread.sleep(forTimeInterval: 0.2)
-                    // Re-reset and re-prepare
-                    engine.stop()
-                    engine.reset()
-                    engine.prepare()
+    /// Full engine restart: reset → re-acquire node → reinstall tap → prepare → start.
+    /// Called when `startEngineAndTap` fails or when the engine needs a complete rebuild
+    /// after a device switch (e.g., AirPods → built-in mic or vice versa).
+    /// Returns true if the engine was successfully started.
+    private func attemptFullEngineRestart(quality: AudioQuality) -> Bool {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        engine.reset()
+
+        let freshNode = engine.inputNode
+        needsSegmentFileOpen = true
+        inputFormat = nil
+
+        freshNode.installTap(onBus: 0,
+                             bufferSize: AudioRecorderActor.tapBufferSize,
+                             format: nil) { [weak self] buffer, time in
+            guard let self else { return }
+            let format = buffer.format
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0 else { return }
+            let data = Self.captureRawBytes(from: buffer)
+            var sumSquares: Float = 0
+            var peak: Float = 0
+            if let floatData = buffer.floatChannelData {
+                let ptr = floatData[0]
+                for i in 0..<frameCount {
+                    let s = ptr[i]; sumSquares += s * s
+                    let a = Swift.abs(s); if a > peak { peak = a }
+                }
+            } else if let int16Data = buffer.int16ChannelData {
+                let ptr = int16Data[0]
+                for i in 0..<frameCount {
+                    let s = Float(ptr[i]) / Float(Int16.max); sumSquares += s * s
+                    let a = Swift.abs(s); if a > peak { peak = a }
                 }
             }
+            let rms = sqrt(sumSquares / Float(max(frameCount, 1)))
+            Task {
+                await self.handleCapturedBuffer(
+                    data: data, format: format, frameCount: frameCount,
+                    rms: min(rms, 1.0), peak: min(peak, 1.0), quality: quality
+                )
+            }
         }
-        if !started {
-            throw lastError ?? AudioError.engineStartFailed
+
+        engine.prepare()
+        do {
+            try engine.start()
+            return true
+        } catch {
+            print("[AudioRecorderActor] ⚠️ Full restart failed: \(error)")
+            return false
         }
     }
 
@@ -811,7 +855,15 @@ actor AudioRecorderActor {
 
                 // Reinstall tap — this will also open a new segment file
                 // on the first buffer (needsSegmentFileOpen = true inside startEngineAndTap)
-                try startEngineAndTap(quality: quality)
+                do {
+                    try startEngineAndTap(quality: quality)
+                } catch {
+                    print("[AudioRecorderActor] ⚠️ Interruption resume: startEngineAndTap failed: \(error) — attempting full restart")
+                    guard attemptFullEngineRestart(quality: quality) else {
+                        state = .error("Failed to resume after interruption: engine restart failed")
+                        return
+                    }
+                }
 
                 state = .recording(sessionID: id)
                 try await dataManager.updateSession(id: id, state: .recording)
@@ -942,7 +994,15 @@ actor AudioRecorderActor {
                 let sessions = try await dataManager.fetchAllSessions()
                 let quality  = sessions.first?.audioQuality ?? .medium
                 try await configureAVAudioSession(quality: quality)
-                try startEngineAndTap(quality: quality)
+                do {
+                    try startEngineAndTap(quality: quality)
+                } catch {
+                    print("[AudioRecorderActor] ⚠️ Route change: startEngineAndTap failed: \(error) — attempting full restart")
+                    guard attemptFullEngineRestart(quality: quality) else {
+                        state = .error("Route change recovery failed: engine restart failed")
+                        return
+                    }
+                }
                 state = .recording(sessionID: sessionID)
 
                 let newDevice = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? "Unknown"
